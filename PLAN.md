@@ -37,7 +37,13 @@ lib/docker_engine/
 ├── client.rb                    # Punto de entrada principal
 ├── adapter.rb                   # Clase base abstracta para adaptadores
 ├── future.rb                    # Future/Promise para resultados asíncronos
+├── pipeline.rb                  # Secuencias declarativas de operaciones
 ├── connection_pool.rb           # Pool genérico de conexiones
+├── pending_store.rb             # Interfaz para almacenar request_id pendientes
+├── pending_stores/
+│   ├── memory.rb                # Store en memoria (mismo proceso)
+│   └── active_record.rb         # Store en DB (procesos separados)
+├── callback_executor.rb         # Thread pool para ejecutar callbacks
 ├── adapters/
 │   ├── cli.rb                   # Adaptador CLI local (Open3/system)
 │   ├── ssh.rb                   # Adaptador SSH remoto (net-ssh + pool)
@@ -195,10 +201,13 @@ class DockerEngine::Future
     end
   end
 
-  # Encadenar transformaciones
+  # Encadenar transformaciones.
+  # Si el bloque devuelve otro Future, se "aplana" automáticamente
+  # (flat_map semántica) para evitar Future<Future<Result>>.
   def then(&block)
     Future.new do
-      block.call(value)
+      result = block.call(value)
+      result.is_a?(Future) ? result.value : result
     end
   end
 
@@ -235,7 +244,410 @@ class DockerEngine::Future
 end
 ```
 
-### 4. `DockerEngine::ConnectionPool` — Pool genérico de conexiones
+### 4. `DockerEngine::Pipeline` — Secuencias sin callback hell
+
+Pipeline resuelve el problema de encadenar múltiples operaciones secuenciales
+sin caer en callbacks anidados. Define los pasos como datos declarativos y
+los ejecuta en orden, pasando el resultado de cada paso al siguiente.
+
+```ruby
+class DockerEngine::Pipeline
+  Step = Struct.new(:name, :action, :depends_on, keyword_init: true)
+
+  def initialize(client)
+    @client = client
+    @steps = []
+  end
+
+  # Definir un paso. El bloque recibe el client y los resultados anteriores.
+  def step(name, depends_on: nil, &action)
+    @steps << Step.new(name: name, action: action, depends_on: depends_on)
+    self
+  end
+
+  # Ejecutar todos los pasos en secuencia. Devuelve Future<Hash> con
+  # los resultados indexados por nombre de paso.
+  def execute
+    Future.new do
+      results = {}
+
+      @steps.each do |step|
+        begin
+          result = step.action.call(@client, results)
+          # Si el action devuelve un Future, esperarlo
+          result = result.value if result.is_a?(Future)
+          results[step.name] = result
+        rescue => e
+          raise PipelineError.new(
+            "Failed at step :#{step.name}: #{e.message}",
+            step: step.name,
+            results_so_far: results,
+            cause: e
+          )
+        end
+      end
+
+      results
+    end
+  end
+
+  # Ejecutar pasos independientes en paralelo cuando no hay dependencias.
+  def execute_parallel
+    Future.new do
+      results = Concurrent::Map.new
+      remaining = @steps.dup
+
+      while remaining.any?
+        # Encontrar pasos cuyas dependencias ya están resueltas
+        ready = remaining.select do |step|
+          step.depends_on.nil? ||
+            Array(step.depends_on).all? { |dep| results.key?(dep) }
+        end
+
+        raise PipelineError, "Circular dependency detected" if ready.empty?
+        remaining -= ready
+
+        # Ejecutar pasos ready en paralelo
+        threads = ready.map do |step|
+          Thread.new do
+            result = step.action.call(@client, results.to_h)
+            result = result.value if result.is_a?(Future)
+            results[step.name] = result
+          end
+        end
+        threads.each(&:join)
+      end
+
+      results.to_h
+    end
+  end
+end
+
+class DockerEngine::PipelineError < DockerEngine::Error
+  attr_reader :step, :results_so_far, :cause
+
+  def initialize(message, step: nil, results_so_far: {}, cause: nil)
+    super(message)
+    @step = step
+    @results_so_far = results_so_far
+    @cause = cause
+  end
+end
+```
+
+**Uso — secuencia de deploy:**
+
+```ruby
+pipeline = DockerEngine::Pipeline.new(client)
+
+pipeline
+  .step(:stop_old) { |c, _| c.containers.stop(name: "web-old", timeout: 30) }
+  .step(:remove_old) { |c, _| c.containers.remove(name: "web-old") }
+  .step(:run_new) { |c, _|
+    c.containers.run(image: "myapp:v2", name: "web-new",
+                     detach: true, network: "kamal")
+  }
+  .step(:health_check) { |c, _| c.containers.inspect(name: "web-new") }
+  .step(:tag) { |c, _| c.images.tag(source: "myapp:v2", target: "myapp:latest") }
+
+# Ejecutar y manejar resultado
+pipeline.execute
+  .on_success { |results| puts results[:health_check].parsed.dig("State", "Status") }
+  .on_failure { |error| puts "Deploy failed at :#{error.step}" }
+```
+
+**Uso — pasos paralelos con dependencias:**
+
+```ruby
+pipeline = DockerEngine::Pipeline.new(client)
+
+pipeline
+  .step(:pull_app) { |c, _| c.images.pull(image: "myapp:v2") }
+  .step(:pull_worker) { |c, _| c.images.pull(image: "myworker:v2") }
+  .step(:stop_app, depends_on: :pull_app) { |c, _|
+    c.containers.stop(name: "app", timeout: 30)
+  }
+  .step(:stop_worker, depends_on: :pull_worker) { |c, _|
+    c.containers.stop(name: "worker", timeout: 30)
+  }
+  .step(:start_app, depends_on: :stop_app) { |c, prev|
+    c.containers.run(image: "myapp:v2", name: "app", detach: true)
+  }
+  .step(:start_worker, depends_on: :stop_worker) { |c, prev|
+    c.containers.run(image: "myworker:v2", name: "worker", detach: true)
+  }
+
+# pull_app y pull_worker corren en paralelo
+# stop_app espera a pull_app, stop_worker espera a pull_worker
+# start_app espera a stop_app, etc.
+pipeline.execute_parallel
+```
+
+**Comparación de los 3 enfoques disponibles:**
+
+```ruby
+# ❌ Callback hell — NO hacer esto
+client.async.containers.stop(name: "old").on_success do
+  client.async.containers.remove(name: "old").on_success do
+    client.async.containers.run(image: "v2", name: "new").on_success do
+      # ... N niveles de indentación
+    end
+  end
+end
+
+# ✅ then encadenado — OK para 2-3 pasos simples
+client.async.containers.stop(name: "old")
+  .then { |_| client.containers.remove(name: "old") }
+  .then { |_| client.containers.run(image: "v2", name: "new", detach: true) }
+  .on_success { |result| puts "Done: #{result}" }
+  .on_failure { |error| puts "Failed: #{error}" }
+
+# ✅ Pipeline — Recomendado para secuencias complejas
+pipeline = DockerEngine::Pipeline.new(client)
+pipeline
+  .step(:stop)   { |c, _| c.containers.stop(name: "old") }
+  .step(:remove) { |c, _| c.containers.remove(name: "old") }
+  .step(:run)    { |c, _| c.containers.run(image: "v2", name: "new", detach: true) }
+  .execute
+```
+
+### 5. `DockerEngine::PendingStore` — Persistencia de operaciones asíncronas
+
+Cuando el adaptador es asíncrono (WebSocket), necesitamos almacenar las
+operaciones pendientes (`request_id` → `Future` o metadata) para poder
+resolver la respuesta cuando llega. Hay dos estrategias según la arquitectura:
+
+#### Estrategia A: Mismo proceso — `PendingStores::Memory`
+
+Para cuando el proceso que envía es el mismo que recibe las respuestas WS.
+Los Futures viven en memoria y se resuelven directamente.
+
+```ruby
+class DockerEngine::PendingStores::Memory < DockerEngine::PendingStore
+  def initialize
+    @store = Concurrent::Map.new  # thread-safe hash
+  end
+
+  def register(request_id, future)
+    @store[request_id] = future
+  end
+
+  def resolve(request_id, result)
+    future = @store.delete(request_id)
+    return unless future
+    future.send(:resolve!, result)
+  end
+
+  def reject(request_id, error)
+    future = @store.delete(request_id)
+    return unless future
+    future.send(:reject!, error)
+  end
+
+  def pending?(request_id)
+    @store.key?(request_id)
+  end
+
+  def pending_count
+    @store.size
+  end
+
+  def reject_all(error)
+    @store.each_value { |future| future.send(:reject!, error) }
+    @store.clear
+  end
+end
+```
+
+#### Estrategia B: Procesos separados — `PendingStores::ActiveRecord`
+
+Para cuando el emisor (ej: web request) y el receptor (ej: WS listener worker)
+son procesos distintos. Los request_id se persisten en DB y la resolución
+notifica al proceso original vía un canal de pub/sub.
+
+```ruby
+# Migración
+# create_table :docker_pending_operations do |t|
+#   t.string  :request_id, null: false, index: { unique: true }
+#   t.string  :status, default: "pending"  # pending, completed, failed
+#   t.jsonb   :operation                    # la Operation serializada
+#   t.jsonb   :result                       # el Result cuando se resuelve
+#   t.string  :error_message
+#   t.string  :callback_channel             # canal pub/sub para notificar
+#   t.timestamps
+# end
+
+class DockerEngine::PendingStores::ActiveRecord < DockerEngine::PendingStore
+  def register(request_id, operation, callback_channel:)
+    DockerPendingOperation.create!(
+      request_id: request_id,
+      status: "pending",
+      operation: operation.to_h,
+      callback_channel: callback_channel
+    )
+  end
+
+  def resolve(request_id, result)
+    record = DockerPendingOperation.find_by!(request_id: request_id)
+    record.update!(status: "completed", result: result.to_h)
+
+    # Notificar al proceso original que la respuesta está lista
+    notify(record.callback_channel, {
+      request_id: request_id,
+      status: "completed",
+      result: result.to_h
+    })
+  end
+
+  def reject(request_id, error)
+    record = DockerPendingOperation.find_by!(request_id: request_id)
+    record.update!(status: "failed", error_message: error.message)
+
+    notify(record.callback_channel, {
+      request_id: request_id,
+      status: "failed",
+      error: error.message
+    })
+  end
+
+  private
+
+  # El mecanismo de notificación es intercambiable:
+  # - ActionCable para apps Rails con WS al browser
+  # - Redis pub/sub para comunicación entre workers
+  # - PostgreSQL LISTEN/NOTIFY para apps sin Redis
+  def notify(channel, payload)
+    ActionCable.server.broadcast(channel, payload)
+    # o: Redis.current.publish(channel, payload.to_json)
+    # o: ActiveRecord::Base.connection.execute("NOTIFY #{channel}, '#{payload.to_json}'")
+  end
+end
+```
+
+**Flujo completo con procesos separados:**
+
+```
+┌─────────────────┐         ┌──────────────┐        ┌─────────────────┐
+│   Web Process   │         │   Database   │        │  WS Listener    │
+│   (Puma/Rails)  │         │  (Postgres)  │        │  (Sidekiq/etc)  │
+└────────┬────────┘         └──────┬───────┘        └────────┬────────┘
+         │                         │                          │
+    1. client.containers           │                          │
+       .stop(name:"web")           │                          │
+         │                         │                          │
+    2. Genera request_id           │                          │
+       INSERT pending_op ────────→ │                          │
+         │                         │                          │
+    3. Envía msg al WS ────────────────────────────────────→  │
+       gateway (vía Redis                                     │
+       queue o HTTP)               │                          │
+         │                         │                          │
+    4. Devuelve request_id         │                          │
+       al caller                   │                          │
+         │                         │                     5. WS gateway
+         │                         │                        recibe respuesta
+         │                         │                          │
+         │                         │ ←── UPDATE status ───────┤
+         │                         │     = "completed"        │
+         │                         │                          │
+         │  ←── NOTIFY/broadcast ──│──────────────────────────┤
+         │     (ActionCable,       │
+         │      Redis pub/sub,     │
+         │      PG NOTIFY)         │
+         │                         │
+    6. Callback se ejecuta         │
+       con el resultado            │
+```
+
+**Configuración del adaptador WebSocket con cada store:**
+
+```ruby
+# Mismo proceso — todo en memoria
+client = DockerEngine::Client.new(
+  adapter: :websocket,
+  url: "wss://gateway/ws",
+  pending_store: :memory              # default
+)
+
+# Procesos separados — persistencia en DB
+client = DockerEngine::Client.new(
+  adapter: :websocket,
+  url: "wss://gateway/ws",
+  pending_store: :active_record,
+  callback_channel: "docker_ops_#{Process.pid}"
+)
+```
+
+### 6. `DockerEngine::CallbackExecutor` — Thread pool para callbacks
+
+Cuando el WS listener recibe una respuesta y resuelve un Future, los callbacks
+registrados con `on_success`/`on_failure` se ejecutan en el hilo del listener.
+Si un callback hace trabajo pesado, bloquea la recepción de otros mensajes.
+
+Solución: despachar callbacks a un thread pool dedicado.
+
+```ruby
+class DockerEngine::CallbackExecutor
+  def initialize(pool_size: 5)
+    @pool = Concurrent::FixedThreadPool.new(pool_size)
+  end
+
+  def dispatch(&block)
+    @pool.post { block.call }
+  end
+
+  def shutdown(timeout: 10)
+    @pool.shutdown
+    @pool.wait_for_termination(timeout)
+  end
+end
+```
+
+El Future usa el executor cuando está configurado:
+
+```ruby
+class DockerEngine::Future
+  def initialize(executor: nil, &block)
+    @executor = executor
+    # ... resto igual
+  end
+
+  def resolve!(result)
+    @mutex.synchronize do
+      @result = result
+      @resolved = true
+      @callbacks_success.each do |cb|
+        if @executor
+          @executor.dispatch { cb.call(result) }
+        else
+          cb.call(result)
+        end
+      end
+      @condition.broadcast
+    end
+  end
+end
+```
+
+**Resultado**: el listener WS procesa mensajes a máxima velocidad sin
+bloquearse por callbacks lentos. Los callbacks se ejecutan en paralelo
+en el thread pool.
+
+```
+WS Listener Thread          CallbackExecutor (pool de 5 threads)
+      │                           │
+      ├── msg arrives ──→ resolve!│
+      │   (no bloquea)            ├── thread 1: callback A (pesado)
+      │                           ├── thread 2: callback B (rápido)
+      ├── msg arrives ──→ resolve!│
+      │   (no bloquea)            ├── thread 3: callback C
+      │                           │
+      ├── msg arrives ──→ resolve!│
+      │   (sigue recibiendo)      ├── thread 1: callback D (reusa thread)
+      │                           │
+```
+
+### 7. `DockerEngine::ConnectionPool` — Pool genérico de conexiones
 
 Pool thread-safe reutilizable por cualquier adaptador que necesite mantener
 conexiones persistentes (SSH, WebSocket, TCP para HTTP API).
@@ -361,7 +773,7 @@ class DockerEngine::ConnectionPool
 end
 ```
 
-### 5. `DockerEngine::Result` — Respuesta estandarizada
+### 8. `DockerEngine::Result` — Respuesta estandarizada
 
 ```ruby
 class DockerEngine::Result
@@ -389,7 +801,7 @@ class DockerEngine::Result
 end
 ```
 
-### 6. Resources — Métodos por recurso
+### 9. Resources — Métodos por recurso
 
 Los resources no conocen el adaptador directamente. Construyen una `Operation`
 (descripción declarativa) y la pasan al adaptador. Esto permite que cualquier
@@ -443,7 +855,7 @@ Cada adaptador recibe `Operation` y la traduce a su mecanismo:
 - **HttpApi** → convierte Operation en `POST /v1.45/containers/create` + body JSON
 - **WebSocket** → serializa Operation como mensaje JSON, envía por WS, espera respuesta
 
-#### 6.1 `DockerEngine::Resources::Container`
+#### 9.1 `DockerEngine::Resources::Container`
 
 | Método | Parámetros | CLI | SSH | HTTP API |
 |--------|-----------|-----|-----|----------|
@@ -461,7 +873,7 @@ Cada adaptador recibe `Operation` y la traduce a su mecanismo:
 | `copy_to` | `name:, path:, archive:` | `docker container cp - <name>:<path>` | igual | `PUT /containers/{id}/archive?path=` |
 | `prune` | `filters: {}, force: true` | `docker container prune --force [--filter ...]` | igual | `POST /containers/prune?filters=` |
 
-#### 6.2 `DockerEngine::Resources::Image`
+#### 9.2 `DockerEngine::Resources::Image`
 
 | Método | Parámetros | CLI | HTTP API |
 |--------|-----------|-----|----------|
@@ -474,20 +886,20 @@ Cada adaptador recibe `Operation` y la traduce a su mecanismo:
 | `prune` | `all: false, filters: {}, force: true` | `docker image prune [--all] --force [--filter ...]` | `POST /images/prune?filters=` |
 | `build` | `context:, tags: [], platform: nil, builder: nil, file: nil, target: nil, build_args: {}, secrets: [], cache_from: nil, cache_to: nil, output: nil, ssh: nil, provenance: nil, sbom: nil, no_cache: false, labels: {}` | `docker buildx build [flags] <context>` | N/A (buildx no tiene API HTTP directa) |
 
-#### 6.3 `DockerEngine::Resources::Network`
+#### 9.3 `DockerEngine::Resources::Network`
 
 | Método | Parámetros | CLI | HTTP API |
 |--------|-----------|-----|----------|
 | `create` | `name:, driver: nil, labels: {}` | `docker network create [--driver ...] <name>` | `POST /networks/create` |
 
-#### 6.4 `DockerEngine::Resources::Registry`
+#### 9.4 `DockerEngine::Resources::Registry`
 
 | Método | Parámetros | CLI | HTTP API |
 |--------|-----------|-----|----------|
 | `login` | `server:, username:, password:` | `docker login <server> -u <user> -p <pass>` | `POST /auth` |
 | `logout` | `server:` | `docker logout <server>` | N/A (no hay endpoint, es local) |
 
-#### 6.5 `DockerEngine::Resources::Builder`
+#### 9.5 `DockerEngine::Resources::Builder`
 
 | Método | Parámetros | CLI | HTTP API |
 |--------|-----------|-----|----------|
@@ -499,7 +911,7 @@ Cada adaptador recibe `Operation` y la traduce a su mecanismo:
 > **Nota:** Buildx no tiene API HTTP. El adaptador HttpApi lanzará
 > `DockerEngine::UnsupportedOperationError` para estas operaciones.
 
-#### 6.6 `DockerEngine::Resources::Context`
+#### 9.6 `DockerEngine::Resources::Context`
 
 | Método | Parámetros | CLI | HTTP API |
 |--------|-----------|-----|----------|
@@ -510,7 +922,7 @@ Cada adaptador recibe `Operation` y la traduce a su mecanismo:
 
 > **Nota:** Contextos Docker son locales al cliente. Solo CLI y SSH los soportan.
 
-#### 6.7 `DockerEngine::Resources::System`
+#### 9.7 `DockerEngine::Resources::System`
 
 | Método | Parámetros | CLI | HTTP API |
 |--------|-----------|-----|----------|
@@ -518,9 +930,9 @@ Cada adaptador recibe `Operation` y la traduce a su mecanismo:
 | `client_version` | — | `docker -v` | N/A |
 | `info` | `format: nil` | `docker info [--format ...]` | `GET /system/info` |
 
-### 7. Adaptadores — Implementación
+### 10. Adaptadores — Implementación
 
-#### 7.1 `DockerEngine::Adapters::Cli` (síncrono)
+#### 10.1 `DockerEngine::Adapters::Cli` (síncrono)
 
 Ejecuta comandos mediante `Open3.capture3` en la máquina local.
 
@@ -542,7 +954,7 @@ class DockerEngine::Adapters::Cli < DockerEngine::Adapter
 end
 ```
 
-#### 7.2 `DockerEngine::Adapters::Ssh` (síncrono + pool de conexiones)
+#### 10.2 `DockerEngine::Adapters::Ssh` (síncrono + pool de conexiones)
 
 Ejecuta comandos en servidor remoto. Usa `ConnectionPool` para reutilizar
 conexiones SSH. Varias operaciones comparten las mismas conexiones sin
@@ -623,7 +1035,7 @@ Thread 3: client.containers.stop("web-3")  ──→ pool.with { |ssh| ... } ─
 # el thread espera hasta @timeout segundos o lanza ConnectionError.
 ```
 
-#### 7.3 `DockerEngine::Adapters::HttpApi` (síncrono)
+#### 10.3 `DockerEngine::Adapters::HttpApi` (síncrono)
 
 Conecta al Docker Engine API vía Unix socket o TCP con TLS opcional.
 
@@ -658,21 +1070,27 @@ class DockerEngine::Adapters::HttpApi < DockerEngine::Adapter
 end
 ```
 
-#### 7.4 `DockerEngine::Adapters::WebSocket` (asíncrono nativo)
+#### 10.4 `DockerEngine::Adapters::WebSocket` (asíncrono nativo)
 
 Un adaptador cuyo transporte es inherentemente asíncrono. No puede devolver
 `Result` directamente porque la respuesta llega en otro momento.
 
+Usa `PendingStore` para almacenar operaciones pendientes y `CallbackExecutor`
+para despachar callbacks sin bloquear el listener.
+
 ```ruby
 class DockerEngine::Adapters::WebSocket < DockerEngine::Adapter
-  def initialize(url:, headers: {})
+  def initialize(url:, headers: {},
+                 pending_store: :memory,
+                 callback_pool_size: 5, **store_options)
     @url = url
     @headers = headers
-    @pending = Concurrent::Map.new   # request_id → Future
+    @pending_store = resolve_store(pending_store, **store_options)
+    @callback_executor = CallbackExecutor.new(pool_size: callback_pool_size)
+    @on_stream = Concurrent::Map.new
     @connection = nil
   end
 
-  # Devuelve siempre un Future<Result>, nunca un Result directo.
   def async?
     true
   end
@@ -681,11 +1099,11 @@ class DockerEngine::Adapters::WebSocket < DockerEngine::Adapter
     ensure_connected!
     request_id = SecureRandom.uuid
 
-    # Crear Future que se resolverá cuando llegue la respuesta
-    future = DockerEngine::Future.new
+    # Crear Future con executor para que los callbacks no bloqueen el listener
+    future = DockerEngine::Future.new(executor: @callback_executor)
 
-    # Registrar como pendiente
-    @pending[request_id] = future
+    # Registrar en el store (memoria o DB)
+    @pending_store.register(request_id, future)
 
     # Enviar operación serializada por WebSocket
     message = {
@@ -718,19 +1136,30 @@ class DockerEngine::Adapters::WebSocket < DockerEngine::Adapter
 
   def close
     @connection&.close
-    # Rechazar todos los futures pendientes
-    @pending.each_value { |f| f.send(:reject!, ConnectionError.new("closed")) }
-    @pending.clear
+    @pending_store.reject_all(ConnectionError.new("closed"))
+    @callback_executor.shutdown
   end
 
   private
+
+  def resolve_store(type, **options)
+    case type
+    when :memory        then PendingStores::Memory.new
+    when :active_record then PendingStores::ActiveRecord.new(**options)
+    when Class          then type.new(**options)
+    else raise ArgumentError, "Unknown pending store: #{type}"
+    end
+  end
 
   def ensure_connected!
     return if @connection&.open?
 
     @connection = WebSocketClient.connect(@url, headers: @headers)
 
-    # Listener que recibe respuestas y resuelve los futures correspondientes
+    # Listener: recibe respuestas y resuelve vía el pending_store.
+    # Este bloque corre en el hilo del WS listener.
+    # Los callbacks se despachan al CallbackExecutor (otro thread pool),
+    # así que este hilo nunca se bloquea.
     @connection.on(:message) do |event|
       data = JSON.parse(event.data)
       request_id = data["id"]
@@ -739,25 +1168,24 @@ class DockerEngine::Adapters::WebSocket < DockerEngine::Adapter
         if data["done"]
           @on_stream.delete(request_id)
         else
-          stream_handler.call(data["output"])
+          @callback_executor.dispatch { stream_handler.call(data["output"]) }
         end
-      elsif (future = @pending.delete(request_id))
+      else
         result = Result.new(
           output: data["output"],
           exit_code: data["exit_code"],
           error: data["error"]
         )
         if result.success?
-          future.send(:resolve!, result)
+          @pending_store.resolve(request_id, result)
         else
-          future.send(:reject!, CommandError.new(result))
+          @pending_store.reject(request_id, CommandError.new(result))
         end
       end
     end
 
     @connection.on(:close) do
-      @pending.each_value { |f| f.send(:reject!, ConnectionError.new("disconnected")) }
-      @pending.clear
+      @pending_store.reject_all(ConnectionError.new("disconnected"))
     end
   end
 end
@@ -794,7 +1222,7 @@ end
     ├── future.on_success { |r| ... }        │  (callback, no bloquea)
 ```
 
-### 8. El Client: Unificando Sync y Async
+### 11. El Client: Unificando Sync y Async
 
 El Client ofrece una interfaz `.async` que envuelve cualquier adaptador
 (incluso los síncronos) en ejecución asíncrona:
@@ -877,7 +1305,7 @@ class DockerEngine::AsyncResourceProxy
 end
 ```
 
-### 9. Manejo de Operaciones No Soportadas
+### 12. Manejo de Operaciones No Soportadas
 
 | Operación | CLI | SSH | HTTP API | WebSocket |
 |-----------|-----|-----|----------|-----------|
@@ -887,7 +1315,7 @@ end
 | `container.copy_from/to` | OK | OK | OK | depende del servidor |
 | `container.logs(follow: true)` | OK (stream) | OK (stream) | OK (stream) | OK (stream) |
 
-### 10. Jerarquía de Errores
+### 13. Jerarquía de Errores
 
 ```ruby
 module DockerEngine
@@ -905,7 +1333,7 @@ module DockerEngine
 end
 ```
 
-### 11. Ejemplo de Uso Completo
+### 14. Ejemplo de Uso Completo
 
 ```ruby
 # ──── Adaptador CLI local ────
@@ -1024,32 +1452,38 @@ ws_client.close
 ### Fase 1: Core
 1. `DockerEngine::Operation` (estructura declarativa de comandos)
 2. `DockerEngine::Result` y `DockerEngine::Errors`
-3. `DockerEngine::Future` (promesas con callbacks y bloqueo)
-4. `DockerEngine::ConnectionPool` (pool genérico thread-safe)
-5. `DockerEngine::Adapter` (clase base abstracta)
-6. `DockerEngine::Client` (con `async` proxy)
+3. `DockerEngine::Future` (promesas con callbacks, `then` con flat-map, bloqueo)
+4. `DockerEngine::CallbackExecutor` (thread pool para callbacks)
+5. `DockerEngine::ConnectionPool` (pool genérico thread-safe)
+6. `DockerEngine::Pipeline` (secuencias declarativas con dependencias)
+7. `DockerEngine::Adapter` (clase base abstracta)
+8. `DockerEngine::Client` (con `async` proxy)
 
 ### Fase 2: Adaptador CLI + Resources
-7. `DockerEngine::Adapters::Cli` (ejecución local con Open3)
-8. `CommandBuilder` (Operation → array de strings para shell)
-9. Todos los Resources (Container, Image, Network, Registry, System, Builder, Context)
-10. Tests unitarios para cada resource con CLI
+9. `DockerEngine::Adapters::Cli` (ejecución local con Open3)
+10. `CommandBuilder` (Operation → array de strings para shell)
+11. Todos los Resources (Container, Image, Network, Registry, System, Builder, Context)
+12. Tests unitarios para cada resource con CLI
+13. Tests de Pipeline (secuencial y paralelo)
 
 ### Fase 3: Adaptador SSH
-11. `DockerEngine::Adapters::Ssh` (net-ssh + ConnectionPool)
-12. Tests con SSH mockeado
-13. Tests de pool de conexiones (concurrencia, idle timeout, reaping)
+14. `DockerEngine::Adapters::Ssh` (net-ssh + ConnectionPool)
+15. Tests con SSH mockeado
+16. Tests de pool de conexiones (concurrencia, idle timeout, reaping)
 
 ### Fase 4: Adaptador HTTP API
-14. `DockerEngine::Adapters::HttpApi` (REST via socket/TCP)
-15. `HttpTranslator` (Operation → HTTP method + path + body)
-16. Manejo de UnsupportedOperationError para buildx/context
-17. Tests con HTTP stubbed
+17. `DockerEngine::Adapters::HttpApi` (REST via socket/TCP)
+18. `HttpTranslator` (Operation → HTTP method + path + body)
+19. Manejo de UnsupportedOperationError para buildx/context
+20. Tests con HTTP stubbed
 
-### Fase 5: Adaptador WebSocket
-18. `DockerEngine::Adapters::WebSocket` (async nativo)
-19. `AsyncProxy` y `AsyncResourceProxy`
-20. Tests con WebSocket mockeado
+### Fase 5: Adaptador WebSocket + Async
+21. `DockerEngine::PendingStore` (interfaz) + `PendingStores::Memory`
+22. `DockerEngine::PendingStores::ActiveRecord` (persistencia DB)
+23. `DockerEngine::Adapters::WebSocket` (async nativo con PendingStore + CallbackExecutor)
+24. `AsyncProxy` y `AsyncResourceProxy`
+25. Tests con WebSocket mockeado
+26. Tests de PendingStore (memory y active_record)
 
 ### Fase 6: Volumen (si necesario)
-21. `DockerEngine::Resources::Volume` (create, ls, rm, prune)
+27. `DockerEngine::Resources::Volume` (create, ls, rm, prune)
